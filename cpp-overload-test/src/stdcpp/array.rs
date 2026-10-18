@@ -17,6 +17,10 @@ use std::marker::PhantomData;
 cpp! {{
     #include <array>
     #include <utility>
+
+    // The `cpp!` macro failed to compile for array type syntax like `int(*)[3]`,
+    // so we have to declare the built-in array type here.
+    typedef int IntArray3[3];
 }}
 
 /// Workaround for missing generic support in the `overload!` macro.
@@ -108,6 +112,35 @@ impl StdArray3 {
         StdArray3(array, PhantomData)
     }
 
+    // Non-member functions
+
+    // internal C++ implementations for `to_array(...)` overloads
+    fn to_array_copy(items: &[T; N]) -> StdArray3 {
+        let items: *const [T; N] = items;
+        // SAFETY: `items` points to `N` initialized elements that stay borrowed until the C++ call
+        // returns, and `N` matches the size of `IntArray3`.
+        let array = unsafe {
+            cpp!([items as "const IntArray3*"] -> *mut c_void as "std::array<int, 3>*" {
+                // `*items` is an lvalue, so this calls the `T(&)[N]` overload.
+                return new std::array<int, 3>(std::to_array(*items));
+            })
+        };
+        StdArray3(array, PhantomData)
+    }
+
+    fn to_array_move(items: &mut [T; N]) -> StdArray3 {
+        let items: *mut [T; N] = items;
+        // SAFETY: `items` points to `N` initialized elements that stay mutably borrowed until the
+        // C++ call returns, and `N` matches the size of `IntArray3`.
+        let array = unsafe {
+            cpp!([items as "IntArray3*"] -> *mut c_void as "std::array<int, 3>*" {
+                // `std::move(*items)` is an rvalue, hence calls the `T(&&)[N]` overload.
+                return new std::array<int, 3>(std::to_array(std::move(*items)));
+            })
+        };
+        StdArray3(array, PhantomData)
+    }
+
     // Array checks (not overloaded)
 
     /// Copy every element out of the array, so tests can check the whole array.
@@ -191,6 +224,26 @@ overload! {
     }
 }
 
+// Non-member functions: `to_array(...)`
+overload! {
+    /// Create an array by copying the elements of a built-in array.
+    ///
+    /// ### Limitations
+    ///
+    /// C++ uses `T(&)[N]` and `T(&&)[N]` to tell lvalue and rvalue arrays apart. Like the move
+    /// constructor, the rvalue overload takes `&mut [T; N]`, because the caller still owns the
+    /// moved-from array in C++. For `int` elements, copying and moving have the same effect,
+    /// meaning tests can't tell which C++ overload was called.
+    fn to_array(items: &[T; N]) -> StdArray3 {
+        StdArray3::to_array_copy(items)
+    }
+
+    /// Create an array by moving the elements of a built-in array.
+    fn to_array(items: &mut [T; N]) -> StdArray3 {
+        StdArray3::to_array_move(items)
+    }
+}
+
 /// These tests show that the correct Rust and C++ overloads are being called.
 #[test]
 pub fn test_array() {
@@ -218,4 +271,13 @@ pub fn test_array() {
     assert_eq!(moved.contents(), [4, 5, 6]);
     // Moving `int` elements leaves them unchanged, so the moved-from array still holds them.
     assert_eq!(to_move.contents(), [4, 5, 6]);
+
+    // Non-member functions: `to_array(...)`
+    let items: [T; N] = [1, 2, 3];
+    let copied_items = to_array(&items);
+    assert_eq!(copied_items.contents(), [1, 2, 3]);
+    let mut items_to_move: [T; N] = [4, 5, 6];
+    let moved_items = to_array(&mut items_to_move);
+    assert_eq!(moved_items.contents(), [4, 5, 6]);
+    assert_eq!(items_to_move, [4, 5, 6]);
 }
